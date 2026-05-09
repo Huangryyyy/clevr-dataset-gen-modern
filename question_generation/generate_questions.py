@@ -54,6 +54,13 @@ parser.add_argument('--synonyms_json', default='synonyms.json',
     help="JSON file defining synonyms for parameter values")
 parser.add_argument('--template_dir', default='CLEVR_1.0_templates',
     help="Directory containing JSON templates for questions")
+parser.add_argument('--question_types', default='all',
+    help="Comma- or space-separated question type filter. Use template " +
+         "families such as zero_hop, one_hop, two_hop, three_hop, " +
+         "same_relate, comparison, compare_integer, single_and, single_or; " +
+         "coarse types such as count, exist, query, attribute_compare, " +
+         "integer_compare; or exact families such as zero_hop:0. The default " +
+         "is all.")
 
 # Output
 parser.add_argument('--output_questions_file',
@@ -82,6 +89,10 @@ parser.add_argument('--reset_counts_every', default=250, type=int,
     help="How often to reset template and answer counts. Higher values will " +
          "result in flatter distributions over templates and answers, but " +
          "will result in longer runtimes.")
+parser.add_argument('--seed', default=None, type=int,
+    help="Random seed for reproducible template instantiation, synonym " +
+         "selection, optional text segments, and question text selection. " +
+         "By default no fixed seed is used.")
 parser.add_argument('--verbose', action='store_true',
     help="Print more verbose output")
 parser.add_argument('--time_dfs', action='store_true',
@@ -89,6 +100,369 @@ parser.add_argument('--time_dfs', action='store_true',
 parser.add_argument('--profile', action='store_true',
     help="If given then run inside cProfile")
 # args = parser.parse_args()
+
+
+QUESTION_TYPE_ALIASES = {
+  'counts': ['count'],
+  'counting': ['count'],
+  'exists': ['exist'],
+  'existence': ['exist'],
+  'yes_no': ['bool'],
+  'boolean': ['bool'],
+  'attribute': ['query'],
+  'attribute_query': ['query'],
+  'query_attribute': ['query'],
+  'compare': ['attribute_compare', 'integer_compare'],
+  'comparison_attribute': ['attribute_compare'],
+  'compare_attribute': ['attribute_compare'],
+  'attr_compare': ['attribute_compare'],
+  'comparison_integer': ['integer_compare'],
+  'compare_count': ['integer_compare'],
+  'count_compare': ['integer_compare'],
+  'and': ['logical_and'],
+  'intersection': ['logical_and'],
+  'or': ['logical_or'],
+  'union': ['logical_or'],
+  'relational': ['relation'],
+  'spatial': ['relation'],
+  'same': ['same_relate'],
+  'same_attribute': ['same_relate'],
+}
+
+COUNT_QUESTION_FINAL_NODES = set([
+  'count', 'filter_count', 'relate_filter_count',
+])
+EXIST_QUESTION_FINAL_NODES = set([
+  'exist', 'filter_exist', 'relate_filter_exist',
+])
+SET_QUESTION_FINAL_NODES = (
+  COUNT_QUESTION_FINAL_NODES | EXIST_QUESTION_FINAL_NODES
+)
+ATTRIBUTE_QUERY_FINAL_NODES = set([
+  'query_size', 'query_color', 'query_material', 'query_shape',
+])
+ATTRIBUTE_COMPARE_FINAL_NODES = set([
+  'equal_size', 'equal_color', 'equal_material', 'equal_shape',
+])
+INTEGER_COMPARE_FINAL_NODES = set([
+  'equal_integer', 'less_than', 'greater_than',
+])
+
+COT_TEMPLATES = {
+  # Fill these placeholders as CoT templates are authored. Lookup order is:
+  # exact family key such as "zero_hop:0", template type such as "zero_hop",
+  # then "default".
+  'zero_hop': '',
+  'one_hop': '',
+  'two_hop': '',
+  'three_hop': '',
+  'same_relate': '',
+  'comparison': '',
+  'compare_integer': '',
+  'single_and': '',
+  'single_or': '',
+  'default': '',
+}
+
+
+def normalize_question_type(s):
+  s = s.strip().lower()
+  if s.endswith('.json'):
+    s = s[:-5]
+  return s.replace('-', '_')
+
+
+def parse_question_types(question_types):
+  if question_types is None:
+    return None
+  question_types = question_types.strip()
+  if question_types == '' or normalize_question_type(question_types) == 'all':
+    return None
+
+  tokens = re.split(r'[,\s]+', question_types)
+  selected = set()
+  for token in tokens:
+    token = normalize_question_type(token)
+    if token == '':
+      continue
+    if token == 'all':
+      return None
+    for expanded in QUESTION_TYPE_ALIASES.get(token, [token]):
+      selected.add(expanded)
+  return selected
+
+
+def question_type_key(template_filename, question_family_index):
+  base = normalize_question_type(os.path.splitext(template_filename)[0])
+  return '%s:%d' % (base, question_family_index)
+
+
+def get_template_question_types(template_filename, question_family_index,
+                                template, metadata):
+  base = normalize_question_type(os.path.splitext(template_filename)[0])
+  final_node_type = template['nodes'][-1]['type']
+  node_type_to_dtype = {n['name']: n['output'] for n in metadata['functions']}
+  final_dtype = node_type_to_dtype[final_node_type]
+  node_types = set(n['type'] for n in template['nodes'])
+
+  question_types = set([
+    base,
+    final_node_type,
+    final_dtype.lower(),
+    question_type_key(template_filename, question_family_index),
+  ])
+
+  if final_node_type in COUNT_QUESTION_FINAL_NODES:
+    question_types.add('count')
+  if final_node_type in EXIST_QUESTION_FINAL_NODES:
+    question_types.add('exist')
+  if final_node_type in ATTRIBUTE_QUERY_FINAL_NODES:
+    question_types.add('query')
+  if final_node_type in ATTRIBUTE_COMPARE_FINAL_NODES:
+    question_types.add('attribute_compare')
+    question_types.add('compare')
+  if final_node_type in INTEGER_COMPARE_FINAL_NODES:
+    question_types.add('integer_compare')
+    question_types.add('compare')
+  if 'intersect' in node_types:
+    question_types.add('logical_and')
+  if 'union' in node_types:
+    question_types.add('logical_or')
+  if any(t == 'relate' or t.startswith('relate_filter') for t in node_types):
+    question_types.add('relation')
+  if any(t.startswith('same_') for t in node_types):
+    question_types.add('same_relate')
+
+  return question_types
+
+
+def filter_templates_by_question_types(templates, metadata, question_types):
+  if question_types is None:
+    return templates
+
+  filtered_templates = {}
+  known_types = set()
+  for (fn, idx), template in templates.items():
+    cur_types = get_template_question_types(fn, idx, template, metadata)
+    known_types.update(cur_types)
+    if cur_types & question_types:
+      filtered_templates[(fn, idx)] = template
+
+  if len(filtered_templates) == 0:
+    common_types = [
+      'zero_hop', 'one_hop', 'two_hop', 'three_hop', 'same_relate',
+      'comparison', 'compare_integer', 'single_and', 'single_or',
+      'count', 'exist', 'query', 'attribute_compare', 'integer_compare',
+      'relation', 'logical_and', 'logical_or',
+    ]
+    msg = 'No templates matched --question_types="%s". Common types: %s'
+    raise ValueError(msg % (','.join(sorted(question_types)),
+                            ', '.join(common_types)))
+
+  unknown_types = question_types - known_types
+  if unknown_types:
+    print('Warning: ignoring unmatched question type(s): %s'
+          % ', '.join(sorted(unknown_types)))
+  return filtered_templates
+
+
+def get_cot_template(template_filename, question_family_index):
+  base = normalize_question_type(os.path.splitext(template_filename)[0])
+  family_key = question_type_key(template_filename, question_family_index)
+  for key in [family_key, base, 'default']:
+    if key in COT_TEMPLATES:
+      return COT_TEMPLATES[key]
+  return ''
+
+
+def get_node_value_inputs(node):
+  if 'side_inputs' in node:
+    return node['side_inputs']
+  return node.get('value_inputs', [])
+
+
+def format_pixel_location(scene_struct, object_idx):
+  coords = scene_struct['objects'][object_idx].get('pixel_coords')
+  if coords is None or len(coords) < 2:
+    return '(unknown, unknown)'
+  return '(%d, %d)' % (int(round(coords[0])), int(round(coords[1])))
+
+
+def format_object_description(scene_struct, object_idx):
+  obj = scene_struct['objects'][object_idx]
+  attrs = []
+  for key in ['size', 'color', 'material', 'shape']:
+    val = obj.get(key)
+    if val:
+      attrs.append(val)
+  if not attrs:
+    return 'object'
+  return ' '.join(attrs)
+
+
+def format_object_with_location(scene_struct, object_idx):
+  return 'the %s, located near %s' % (
+    format_object_description(scene_struct, object_idx),
+    format_pixel_location(scene_struct, object_idx))
+
+
+def format_relation_phrase(relation, reference='that object'):
+  phrases = {
+    'left': 'to the left of %s',
+    'right': 'to the right of %s',
+    'front': 'in front of %s',
+    'behind': 'behind %s',
+  }
+  return phrases.get(relation, '%s of %%s' % relation) % reference
+
+
+def format_answer_for_cot(answer):
+  if answer is True:
+    return 'yes'
+  if answer is False:
+    return 'no'
+  return str(answer)
+
+
+def format_object_list_for_cot(scene_struct, object_idxs):
+  object_idxs = list(object_idxs)
+  if len(object_idxs) == 0:
+    return ''
+  parts = [format_object_with_location(scene_struct, idx)
+           for idx in object_idxs]
+  if len(parts) == 1:
+    return parts[0]
+  return '%s, and %s' % (', '.join(parts[:-1]), parts[-1])
+
+
+def fill_cot_template(context, generator_name):
+  """
+  CoT hook for future implementation.
+
+  Keep the output as a plain string. Future generators can read
+  context['template_values'], context['program'], context['answer'], etc. and
+  return a filled natural-language rationale.
+  """
+  return get_cot_template(context['template_filename'],
+                          context['question_family_index'])
+
+
+def generate_zero_hop_cot(context):
+  return fill_cot_template(context, 'generate_zero_hop_cot')
+
+
+def generate_one_hop_cot(context):
+  return fill_cot_template(context, 'generate_one_hop_cot')
+
+
+def generate_two_hop_cot(context):
+  return fill_cot_template(context, 'generate_two_hop_cot')
+
+
+def generate_three_hop_cot(context):
+  scene_struct = context['scene_struct']
+  metadata = context['metadata']
+  program = context['program']
+  outputs = qeng.answer_question(
+      {'nodes': program}, metadata, scene_struct, all_outputs=True)
+
+  unique_nodes = [i for i, node in enumerate(program)
+                  if node['type'] == 'unique']
+  relate_nodes = [i for i, node in enumerate(program)
+                  if node['type'] == 'relate']
+  if len(unique_nodes) < 3 or len(relate_nodes) < 3:
+    return fill_cot_template(context, 'generate_three_hop_cot')
+
+  chain_objects = [outputs[i] for i in unique_nodes[:3]]
+  relations = [get_node_value_inputs(program[i])[0] for i in relate_nodes[:3]]
+
+  steps = [
+    'Step 1: I first find %s.' %
+    format_object_with_location(scene_struct, chain_objects[0]),
+    'Step 2: The object %s is %s.' % (
+        format_relation_phrase(relations[0]),
+        format_object_with_location(scene_struct, chain_objects[1])),
+    'Step 3: The object %s is %s.' % (
+        format_relation_phrase(relations[1]),
+        format_object_with_location(scene_struct, chain_objects[2])),
+  ]
+
+  final_node = program[-1]
+  final_node_type = final_node['type']
+  if final_node_type in ATTRIBUTE_QUERY_FINAL_NODES:
+    final_object = outputs[final_node['inputs'][0]]
+    steps.append('Step 4: The object %s is %s.' % (
+        format_relation_phrase(relations[2]),
+        format_object_with_location(scene_struct, final_object)))
+  elif final_node_type in SET_QUESTION_FINAL_NODES:
+    final_object_idxs = outputs[final_node['inputs'][0]]
+    relation_phrase = format_relation_phrase(relations[2])
+    if len(final_object_idxs) == 0:
+      steps.append('Step 4: No matching object is %s.' % relation_phrase)
+    elif len(final_object_idxs) == 1:
+      steps.append('Step 4: The matching object %s is %s.' % (
+          relation_phrase,
+          format_object_list_for_cot(scene_struct, final_object_idxs)))
+    else:
+      steps.append('Step 4: The matching objects %s are %s.' % (
+          relation_phrase,
+          format_object_list_for_cot(scene_struct, final_object_idxs)))
+  else:
+    return fill_cot_template(context, 'generate_three_hop_cot')
+
+  steps.append('Answer: %s.' % format_answer_for_cot(context['answer']))
+  return '\n'.join(steps)
+
+
+def generate_same_relate_cot(context):
+  return fill_cot_template(context, 'generate_same_relate_cot')
+
+
+def generate_comparison_cot(context):
+  return fill_cot_template(context, 'generate_comparison_cot')
+
+
+def generate_compare_integer_cot(context):
+  return fill_cot_template(context, 'generate_compare_integer_cot')
+
+
+def generate_single_and_cot(context):
+  return fill_cot_template(context, 'generate_single_and_cot')
+
+
+def generate_single_or_cot(context):
+  return fill_cot_template(context, 'generate_single_or_cot')
+
+
+def generate_default_cot(context):
+  return fill_cot_template(context, 'generate_default_cot')
+
+
+COT_GENERATORS = {
+  # Add family-specific generators with keys like "zero_hop:0" when a family
+  # needs custom CoT filling logic. Otherwise generation falls back to the
+  # template-file-level generator below.
+  'zero_hop': generate_zero_hop_cot,
+  'one_hop': generate_one_hop_cot,
+  'two_hop': generate_two_hop_cot,
+  'three_hop': generate_three_hop_cot,
+  'same_relate': generate_same_relate_cot,
+  'comparison': generate_comparison_cot,
+  'compare_integer': generate_compare_integer_cot,
+  'single_and': generate_single_and_cot,
+  'single_or': generate_single_or_cot,
+}
+
+
+def generate_cot(context):
+  template_type = normalize_question_type(
+    os.path.splitext(context['template_filename'])[0])
+  family_key = question_type_key(context['template_filename'],
+                                 context['question_family_index'])
+  generator = COT_GENERATORS.get(family_key)
+  if generator is None:
+    generator = COT_GENERATORS.get(template_type, generate_default_cot)
+  return generator(context)
 
 
 def precompute_filter_options(scene_struct, metadata):
@@ -479,10 +853,12 @@ def instantiate_templates_dfs(scene_struct, template, metadata, answer_counts,
       })
 
   # Actually instantiate the template with the solutions we've found
-  text_questions, structured_questions, answers = [], [], []
+  text_questions, structured_questions = [], []
+  answers, template_values = [], []
   for state in final_states:
     structured_questions.append(state['nodes'])
     answers.append(state['answer'])
+    template_values.append({k: v for k, v in state['vals'].items()})
     text = random.choice(template['text'])
     for name, val in state['vals'].items():
       if val in synonyms:
@@ -494,7 +870,7 @@ def instantiate_templates_dfs(scene_struct, template, metadata, answer_counts,
     text = other_heuristic(text, state['vals'])
     text_questions.append(text)
 
-  return text_questions, structured_questions, answers
+  return text_questions, structured_questions, answers, template_values
 
 
 
@@ -530,6 +906,10 @@ def replace_optionals(s):
 
 
 def main(args):
+  if args.seed is not None:
+    random.seed(args.seed)
+    print('Using random seed %d' % args.seed)
+
   with open(args.metadata_file, 'r') as f:
     metadata = json.load(f)
     dataset = metadata['dataset']
@@ -545,7 +925,10 @@ def main(args):
   # Key is (filename, file_idx)
   num_loaded_templates = 0
   templates = {}
-  for fn in os.listdir(args.template_dir):
+  template_filenames = os.listdir(args.template_dir)
+  if args.seed is not None:
+    template_filenames = sorted(template_filenames)
+  for fn in template_filenames:
     if not fn.endswith('.json'): continue
     with open(os.path.join(args.template_dir, fn), 'r') as f:
       base = os.path.splitext(fn)[0]
@@ -554,6 +937,15 @@ def main(args):
         key = (fn, i)
         templates[key] = template
   print('Read %d templates from disk' % num_loaded_templates)
+
+  question_types = parse_question_types(args.question_types)
+  templates = filter_templates_by_question_types(templates, metadata,
+                                                 question_types)
+  if question_types is None:
+    print('Using all %d templates' % len(templates))
+  else:
+    print('Using %d templates matching question type(s): %s'
+          % (len(templates), ', '.join(sorted(question_types))))
 
   def reset_counts():
     # Maps a template (filename, index) to the number of questions we have
@@ -622,7 +1014,7 @@ def main(args):
         print('trying template ', fn, idx)
       if args.time_dfs and args.verbose:
         tic = time.time()
-      ts, qs, ans = instantiate_templates_dfs(
+      ts, qs, ans, vals = instantiate_templates_dfs(
                       scene_struct,
                       template,
                       metadata,
@@ -634,7 +1026,7 @@ def main(args):
         toc = time.time()
         print('that took ', toc - tic)
       image_index = int(os.path.splitext(scene_fn)[0].split('_')[-1])
-      for t, q, a in zip(ts, qs, ans):
+      for t, q, a, v in zip(ts, qs, ans, vals):
         questions.append({
           'split': scene_info['split'],
           'image_filename': scene_fn,
@@ -646,6 +1038,17 @@ def main(args):
           'template_filename': fn,
           'question_family_index': idx,
           'question_index': len(questions),
+          'cot': generate_cot({
+            'template_filename': fn,
+            'question_family_index': idx,
+            'template': template,
+            'template_values': v,
+            'question': t,
+            'program': q,
+            'answer': a,
+            'scene_struct': scene_struct,
+            'metadata': metadata,
+          }),
         })
       if len(ts) > 0:
         if args.verbose:
@@ -692,4 +1095,3 @@ if __name__ == '__main__':
     cProfile.run('main(args)')
   else:
     main(args)
-

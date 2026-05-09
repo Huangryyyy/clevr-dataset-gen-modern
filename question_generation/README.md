@@ -29,6 +29,95 @@ the flag `--instances_per_template` gives the number of instantiations we will t
 of questions per image will be the product of `--templates_per_image` and `--instances_per_template`; however some images may
 have slightly fewer questions if no valid template instantiations can be found.
 
+## Reproducible generation
+Question generation uses randomness when shuffling candidate template values, choosing text templates, replacing values with
+synonyms, and deciding whether optional text segments should be kept. Use `--seed` to make these choices reproducible:
+
+```bash
+python generate_questions.py \
+  --input_scene_file $INPUT_FILE \
+  --output_questions_file $OUTPUT_FILE \
+  --seed 123
+```
+
+When `--seed` is set, template filenames are also loaded in sorted order so that repeated runs with the same input file and
+arguments produce the same generated questions.
+
+## Selecting question types
+By default, all templates in `CLEVR_1.0_templates` are eligible for generation. Use `--question_types` to restrict generation
+to one or more template families, coarse semantic types, or exact question families. Values may be comma-separated or
+space-separated.
+
+Template-family filters:
+
+- `zero_hop`
+- `one_hop`
+- `two_hop`
+- `three_hop`
+- `same_relate`
+- `comparison`
+- `compare_integer`
+- `single_and`
+- `single_or`
+
+Coarse semantic filters:
+
+- `count`: questions whose answer is an integer count
+- `exist`: existence questions whose answer is true or false
+- `query`: attribute-query questions such as size, color, material, or shape
+- `attribute_compare`: comparisons of two objects' attributes
+- `integer_compare`: comparisons of two counts
+- `relation`: questions that use spatial relations
+- `logical_and`: intersection-style questions
+- `logical_or`: union-style questions
+
+Exact family filters use the template filename stem and family index, for example `zero_hop:0`.
+
+Examples:
+
+```bash
+python generate_questions.py \
+  --input_scene_file $INPUT_FILE \
+  --output_questions_file $OUTPUT_FILE \
+  --question_types zero_hop,one_hop
+```
+
+```bash
+python generate_questions.py \
+  --input_scene_file $INPUT_FILE \
+  --output_questions_file $OUTPUT_FILE \
+  --question_types count,exist
+```
+
+```bash
+python generate_questions.py \
+  --input_scene_file $INPUT_FILE \
+  --output_questions_file $OUTPUT_FILE \
+  --question_types three_hop:2
+```
+
+If the selected question types contain fewer templates than `--templates_per_image`, the script can only instantiate from
+the selected templates.
+
+## Chain-of-thought output
+Each generated question now includes an additional `cot` field in the output JSON. The field is always a string.
+
+For most question types, `cot` is currently an empty string placeholder. The script includes a `COT_TEMPLATES` dictionary
+and one `generate_*_cot(context)` function per template family so that future CoT templates can be filled in one place.
+Generator functions receive a context object containing the template filename, family index, instantiated template values,
+natural-language question, functional program, answer, scene structure, and metadata.
+
+The `three_hop` family has a concrete English CoT implementation. It follows the spatial chain through the instantiated
+program, reads object pixel coordinates from `pixel_coords`, and emits a string like:
+
+```text
+Step 1: I first find the small yellow rubber cylinder, located near (190, 122).
+Step 2: The object to the right of that object is the small blue rubber sphere, located near (231, 104).
+Step 3: The object behind that object is the small brown rubber cube, located near (69, 97).
+Step 4: No matching object is to the right of that object.
+Answer: 0.
+```
+
 ## Question Templates
 Each question template consists of four components:
 

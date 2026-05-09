@@ -23,28 +23,37 @@ python render_images.py --help
 ```
 
 ## Setup
-You will need to download and install [Blender](https://www.blender.org/); code has been developed and tested using Blender version 2.78c but other versions may work as well.
+You will need to download and install [Blender](https://www.blender.org/). This fork keeps the original Blender 2.78c path working where possible, and updates the image-generation scripts for Blender 3.6 LTS.
 
-Blender ships with its own version of Python 3.5, and it uses its bundled Python to execute scripts. You'll need to add this directory to the Python path of Blender's bundled Python with a command like this:
-
-```
-echo $PWD >> $BLENDER/$VERSION/python/lib/python3.5/site-packages/clevr.pth
-```
-
-where `$BLENDER` is the directory where Blender is installed and `$VERSION` is your Blender version; for example on OSX you might run:
+Blender ships with its own Python. Blender 3.6 uses Python 3.10, and it uses that bundled Python to execute scripts. If you run `render_images.py` from this directory then `utils.py` is usually found automatically; if Blender still cannot import it, add this directory to Blender's bundled Python path:
 
 ```
-echo $PWD >> /Applications/blender/blender.app/Contents/Resources/2.78/python/lib/python3.5/site-packages/clevr.pth
+echo $PWD >> $BLENDER/3.6/python/lib/python3.10/site-packages/clevr.pth
+```
+
+where `$BLENDER` is the directory where Blender is installed. For example, with the official Linux tarball this may look like:
+
+```
+echo $PWD >> /opt/blender-3.6.23-linux-x64/3.6/python/lib/python3.10/site-packages/clevr.pth
+```
+
+You can then render some images with Blender 3.6 like this:
+
+```
+cd image_generation
+/opt/blender-3.6.23-linux-x64/blender --background --python render_images.py -- --num_images 10
 ```
 
 ## Rendering Overview
 The file `data/base_scene.blend` contains a Blender scene used for the basis of all CLEVR images. This scene contains a ground plane, a camera, and several light sources. After loading the base scene, the positions of the camera and lights are randomly jittered (controlled with the `--key_light_jitter`, `--fill_light_jitter`, `--back_light_jitter`, and `--camera_jitter` flags).
 
-After the base scene has been loaded, objects are placed one by one into the scene. The number of objects for each scene is a random integer between `--min_objects` (default 3) and `--max_objects` (default 10), and each object has a random shape, size, color, and material.
+After the base scene has been loaded, objects are placed one by one into the scene. The number of objects for each scene is a random integer between `--min_objects` (default 3) and `--max_objects` (default 10), and each object has a random shape, size, color, and material. To force an exact count in every image, pass `--num_objects N`; this overrides the min/max range.
 
 After placing all objects, we ensure that no objects are fully occluded; in particular each object must occupy at least 100 pixels in the rendered image (customizable using `--min_pixels_per_object`). To accomplish this, we assign each object a unique color and render a version of the scene with lighting and shading disabled, writing it to a temporary file; we can then count the number of pixels of each color in this pre-render to check the number of visible pixels for each object.
 
 Each invocation of `render_images.py` will render `--num_images` images, and they will be numbered starting at `--start_idx` (default 0). Using non-default values for `--start_idx` allows you to distribute rendering across many workers and recombine their results later without filename conflicts.
+
+For reproducible generation, pass `--random_seed SEED` or `--seed SEED`. Each image uses `SEED + image_index`, so image indices remain reproducible even when rendering is split across workers with different `--start_idx` values.
 
 ### Object Placement
 Each object is positioned randomly, but before actually adding the object to the scene we ensure that its center is at least `--min_dist` units away from the centers of all other objects. We also ensure that between each pair of objects, the left/right and front/back distance along the ground plane is at least `--margin` units; this helps to minimize ambiguous spatial relationships. If after `--max_retries` attempts we are unable to find a suitable position for an object, then all objects are deleted and placed again from scratch.
@@ -53,7 +62,19 @@ Each object is positioned randomly, but before actually adding the object to the
 By default images are rendered at `320x240`, but the resolution can be customized using the `--height` and `--width` flags.
 
 ### GPU Acceleration
-Rendering uses CPU by default, but if you have an NVIDIA GPU with CUDA installed then you can use the GPU to accelerate rendering by adding the flag `--use_gpu 1`. Blender also supports acceleration using OpenCL which allows the use of non-NVIDIA GPUs; however this is not currently supported by `render_images.py`.
+Rendering uses CPU by default. To use an NVIDIA GPU with Blender 3.6, add `--use_gpu 1`; by default this enables the CUDA backend:
+
+```
+blender --background --python render_images.py -- --num_images 10 --use_gpu 1 --gpu_backend CUDA
+```
+
+For RTX cards, `OPTIX` may be faster:
+
+```
+blender --background --python render_images.py -- --num_images 10 --use_gpu 1 --gpu_backend OPTIX
+```
+
+The script also accepts Blender 3.6's other Cycles backends: `HIP`, `ONEAPI`, and `METAL`, assuming your Blender build and hardware support them.
 
 ### Rendering Quality
 You can control the quality of rendering with the `--render_num_samples` flag; using fewer samples will run more quickly but will result in grainy images. I've found that 64 samples is a good number to use for development; all released CLEVR images were rendered using 512 samples. The `--render_min_bounces` and `--render_max_bounces` control the number of bounces for transparent objects; I've found the default of 8 to work well for these options.

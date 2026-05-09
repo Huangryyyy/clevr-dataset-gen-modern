@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree. An additional grant
 # of patent rights can be found in the PATENTS file in the same directory.
 
-import sys, random, os
+import sys, random, os, math
 import bpy, bpy_extras
 
 
@@ -33,12 +33,32 @@ def parse_args(parser, argv=None):
   return parser.parse_args(extract_args(argv))
 
 
+def blender_version_at_least(major, minor=0, patch=0):
+  return bpy.app.version >= (major, minor, patch)
+
+
+def set_active_object(obj):
+  if blender_version_at_least(2, 80, 0):
+    bpy.context.view_layer.objects.active = obj
+  else:
+    bpy.context.scene.objects.active = obj
+
+
+def select_object(obj, state=True):
+  if hasattr(obj, 'select_set'):
+    obj.select_set(state)
+  else:
+    obj.select = state
+
+
 # I wonder if there's a better way to do this?
 def delete_object(obj):
   """ Delete a specified blender object """
-  for o in bpy.data.objects:
-    o.select = False
-  obj.select = True
+  if obj is None:
+    return
+  bpy.ops.object.select_all(action='DESELECT')
+  set_active_object(obj)
+  select_object(obj, True)
   bpy.ops.object.delete()
 
 
@@ -67,6 +87,13 @@ def get_camera_coords(cam, pos):
 
 def set_layer(obj, layer_idx):
   """ Move an object to a particular layer """
+  if blender_version_at_least(2, 80, 0):
+    # Blender 2.80 replaced layers with collections. The only use in this
+    # project is to hide helper objects during a render pass.
+    obj.hide_render = (layer_idx != 0)
+    obj.hide_set(layer_idx != 0)
+    return
+
   # Set the target layer to True first because an object must always be on
   # at least one layer.
   obj.layers[layer_idx] = True
@@ -91,19 +118,25 @@ def add_object(object_dir, name, scale, loc, theta=0):
     if obj.name.startswith(name):
       count += 1
 
+  old_objects = set(bpy.data.objects.keys())
   filename = os.path.join(object_dir, '%s.blend' % name, 'Object', name)
   bpy.ops.wm.append(filename=filename)
+  new_objects = [obj for obj in bpy.data.objects if obj.name not in old_objects]
+  assert len(new_objects) == 1, 'Expected one object in %s' % filename
+  obj = new_objects[0]
 
   # Give it a new name to avoid conflicts
   new_name = '%s_%d' % (name, count)
-  bpy.data.objects[name].name = new_name
+  obj.name = new_name
 
   # Set the new object as active, then rotate, scale, and translate it
   x, y = loc
-  bpy.context.scene.objects.active = bpy.data.objects[new_name]
-  bpy.context.object.rotation_euler[2] = theta
-  bpy.ops.transform.resize(value=(scale, scale, scale))
-  bpy.ops.transform.translate(value=(x, y, scale))
+  bpy.ops.object.select_all(action='DESELECT')
+  set_active_object(obj)
+  select_object(obj, True)
+  obj.rotation_euler[2] = math.radians(theta)
+  obj.scale = (scale, scale, scale)
+  obj.location = (x, y, scale)
 
 
 def load_materials(material_dir):
@@ -127,15 +160,12 @@ def add_material(name, **properties):
   # Figure out how many materials are already in the scene
   mat_count = len(bpy.data.materials)
 
-  # Create a new material; it is not attached to anything and
-  # it will be called "Material"
-  bpy.ops.material.new()
-
-  # Get a reference to the material we just created and rename it;
-  # then the next time we make a new material it will still be called
-  # "Material" and we will still be able to look it up by name
-  mat = bpy.data.materials['Material']
-  mat.name = 'Material_%d' % mat_count
+  # Create a new node material directly. This works in both Blender 2.7x
+  # and the 2.80+ collection/view-layer API.
+  mat = bpy.data.materials.new('Material_%d' % mat_count)
+  mat.use_nodes = True
+  if 'Color' in properties:
+    set_material_diffuse_color(mat, properties['Color'])
 
   # Attach the new material to the active object
   # Make sure it doesn't already have materials
@@ -146,9 +176,10 @@ def add_material(name, **properties):
   # Find the output node of the new material
   output_node = None
   for n in mat.node_tree.nodes:
-    if n.name == 'Material Output':
+    if n.name == 'Material Output' or getattr(n, 'type', None) == 'OUTPUT_MATERIAL':
       output_node = n
       break
+  assert output_node is not None, 'Could not find material output node'
 
   # Add a new GroupNode to the node tree of the active material,
   # and copy the node tree from the preloaded node group to the
@@ -165,8 +196,18 @@ def add_material(name, **properties):
 
   # Wire the output of the new group node to the input of
   # the MaterialOutput node
+  surface_input = output_node.inputs['Surface']
+  for link in list(mat.node_tree.links):
+    if link.to_node == output_node and link.to_socket == surface_input:
+      mat.node_tree.links.remove(link)
   mat.node_tree.links.new(
       group_node.outputs['Shader'],
-      output_node.inputs['Surface'],
+      surface_input,
   )
 
+
+def set_material_diffuse_color(mat, rgba):
+  try:
+    mat.diffuse_color = rgba
+  except (TypeError, ValueError):
+    mat.diffuse_color = rgba[:3]

@@ -32,14 +32,18 @@ if INSIDE_BLENDER:
   try:
     import utils
   except ImportError as e:
-    print("\nERROR")
-    print("Running render_images.py from Blender and cannot import utils.py.") 
-    print("You may need to add a .pth file to the site-packages of Blender's")
-    print("bundled python with a command like this:\n")
-    print("echo $PWD >> $BLENDER/$VERSION/python/lib/python3.5/site-packages/clevr.pth")
-    print("\nWhere $BLENDER is the directory where Blender is installed, and")
-    print("$VERSION is your Blender version (such as 2.78).")
-    sys.exit(1)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if script_dir not in sys.path:
+      sys.path.insert(0, script_dir)
+    try:
+      import utils
+    except ImportError as e:
+      print("\nERROR")
+      print("Running render_images.py from Blender and cannot import utils.py.")
+      print("Try running from the image_generation directory or add it to")
+      print("Blender's Python path. For Blender 3.6 this is usually:")
+      print("echo $PWD >> $BLENDER/3.6/python/lib/python3.10/site-packages/clevr.pth")
+      sys.exit(1)
 
 parser = argparse.ArgumentParser()
 
@@ -68,6 +72,9 @@ parser.add_argument('--min_objects', default=3, type=int,
     help="The minimum number of objects to place in each scene")
 parser.add_argument('--max_objects', default=10, type=int,
     help="The maximum number of objects to place in each scene")
+parser.add_argument('--num_objects', default=None, type=int,
+    help="If set, render exactly this many objects in every image. This " +
+         "overrides --min_objects and --max_objects.")
 parser.add_argument('--min_dist', default=0.25, type=float,
     help="The minimum allowed distance between object centers")
 parser.add_argument('--margin', default=0.4, type=float,
@@ -81,6 +88,10 @@ parser.add_argument('--min_pixels_per_object', default=200, type=int,
 parser.add_argument('--max_retries', default=50, type=int,
     help="The number of times to try placing an object before giving up and " +
          "re-placing all objects in the scene.")
+parser.add_argument('--random_seed', '--seed', dest='random_seed',
+    default=None, type=int,
+    help="Optional random seed for reproducible image generation. When set, " +
+         "each image uses seed + image_index so distributed runs are stable.")
 
 # Output settings
 parser.add_argument('--start_idx', default=0, type=int,
@@ -124,9 +135,12 @@ parser.add_argument('--date', default=dt.today().strftime("%m/%d/%Y"),
 
 # Rendering options
 parser.add_argument('--use_gpu', default=0, type=int,
-    help="Setting --use_gpu 1 enables GPU-accelerated rendering using CUDA. " +
-         "You must have an NVIDIA GPU with the CUDA toolkit installed for " +
-         "to work.")
+    help="Setting --use_gpu 1 enables GPU-accelerated Cycles rendering. " +
+         "Use --gpu_backend to choose CUDA, OPTIX, HIP, ONEAPI, or METAL.")
+parser.add_argument('--gpu_backend', default='CUDA',
+    choices=['CUDA', 'OPTIX', 'HIP', 'ONEAPI', 'METAL'],
+    help="GPU backend to enable when --use_gpu 1 is set. CUDA and OPTIX are " +
+         "the usual NVIDIA choices in Blender 3.6.")
 parser.add_argument('--width', default=320, type=int,
     help="The width (in pixels) for the rendered images")
 parser.add_argument('--height', default=240, type=int,
@@ -152,7 +166,105 @@ parser.add_argument('--render_tile_size', default=256, type=int,
          "rendering may achieve better performance using smaller tile sizes " +
          "while larger tile sizes may be optimal for GPU-based rendering.")
 
+
+def set_if_exists(owner, attr, value):
+  if hasattr(owner, attr):
+    try:
+      setattr(owner, attr, value)
+    except TypeError:
+      pass
+
+
+def rotate_vector(rotation, vec):
+  try:
+    return rotation @ vec
+  except TypeError:
+    return rotation * vec
+
+
+def add_plane(size):
+  if bpy.app.version >= (2, 80, 0):
+    bpy.ops.mesh.primitive_plane_add(size=size)
+  else:
+    bpy.ops.mesh.primitive_plane_add(radius=size / 2.0)
+
+
+def set_render_tile_size(scene, tile_size):
+  render_args = scene.render
+  if hasattr(render_args, 'tile_x'):
+    render_args.tile_x = tile_size
+    render_args.tile_y = tile_size
+  elif hasattr(scene, 'cycles') and hasattr(scene.cycles, 'tile_size'):
+    scene.cycles.tile_size = tile_size
+
+
+def get_preferences():
+  if hasattr(bpy.context, 'preferences'):
+    return bpy.context.preferences
+  return bpy.context.user_preferences
+
+
+def ensure_cycles_addon():
+  prefs = get_preferences()
+  if 'cycles' not in prefs.addons:
+    if hasattr(bpy.ops, 'preferences'):
+      bpy.ops.preferences.addon_enable(module='cycles')
+    else:
+      bpy.ops.wm.addon_enable(module='cycles')
+  return prefs.addons['cycles'].preferences
+
+
+def refresh_cycles_devices(cycles_prefs):
+  if hasattr(cycles_prefs, 'refresh_devices'):
+    cycles_prefs.refresh_devices()
+  elif hasattr(cycles_prefs, 'get_devices'):
+    cycles_prefs.get_devices()
+
+
+def configure_cycles_devices(gpu_backend):
+  cycles_prefs = ensure_cycles_addon()
+  try:
+    cycles_prefs.compute_device_type = gpu_backend
+  except TypeError:
+    msg = 'Cycles GPU backend "%s" is not available in this Blender build'
+    raise RuntimeError(msg % gpu_backend)
+
+  refresh_cycles_devices(cycles_prefs)
+  enabled_devices = []
+  devices = getattr(cycles_prefs, 'devices', [])
+  for device in devices:
+    use_device = getattr(device, 'type', '') == gpu_backend
+    device.use = use_device
+    if use_device:
+      enabled_devices.append(device.name)
+
+  if len(enabled_devices) == 0:
+    print('WARNING: No %s Cycles devices were reported by Blender' %
+          gpu_backend)
+  else:
+    print('Using Cycles %s device(s): %s' %
+          (gpu_backend, ', '.join(enabled_devices)))
+
+
+def get_object(name):
+  return bpy.data.objects.get(name)
+
+
+def validate_args(args):
+  if args.num_objects is not None and args.num_objects < 0:
+    raise ValueError('--num_objects must be nonnegative')
+  if args.min_objects > args.max_objects:
+    raise ValueError('--min_objects must be less than or equal to --max_objects')
+
+
+def get_num_objects(args):
+  if args.num_objects is not None:
+    return args.num_objects
+  return random.randint(args.min_objects, args.max_objects)
+
+
 def main(args):
+  validate_args(args)
   num_digits = 6
   prefix = '%s_%s_' % (args.filename_prefix, args.split)
   img_template = '%s%%0%dd.png' % (prefix, num_digits)
@@ -171,20 +283,27 @@ def main(args):
   
   all_scene_paths = []
   for i in range(args.num_images):
+    output_index = i + args.start_idx
+    scene_seed = None
+    if args.random_seed is not None:
+      scene_seed = args.random_seed + output_index
+      random.seed(scene_seed)
+
     img_path = img_template % (i + args.start_idx)
     scene_path = scene_template % (i + args.start_idx)
     all_scene_paths.append(scene_path)
     blend_path = None
     if args.save_blendfiles == 1:
       blend_path = blend_template % (i + args.start_idx)
-    num_objects = random.randint(args.min_objects, args.max_objects)
+    num_objects = get_num_objects(args)
     render_scene(args,
       num_objects=num_objects,
-      output_index=(i + args.start_idx),
+      output_index=output_index,
       output_split=args.split,
       output_image=img_path,
       output_scene=scene_path,
       output_blendfile=blend_path,
+      random_seed=scene_seed,
     )
 
   # After rendering all images, combine the JSON files for each scene into a
@@ -193,13 +312,16 @@ def main(args):
   for scene_path in all_scene_paths:
     with open(scene_path, 'r') as f:
       all_scenes.append(json.load(f))
+  info = {
+    'date': args.date,
+    'version': args.version,
+    'split': args.split,
+    'license': args.license,
+  }
+  if args.random_seed is not None:
+    info['random_seed'] = args.random_seed
   output = {
-    'info': {
-      'date': args.date,
-      'version': args.version,
-      'split': args.split,
-      'license': args.license,
-    },
+    'info': info,
     'scenes': all_scenes
   }
   with open(args.output_scene_file, 'w') as f:
@@ -214,6 +336,7 @@ def render_scene(args,
     output_image='render.png',
     output_scene='render_json',
     output_blendfile=None,
+    random_seed=None,
   ):
 
   # Load the main blendfile
@@ -231,23 +354,22 @@ def render_scene(args,
   render_args.resolution_x = args.width
   render_args.resolution_y = args.height
   render_args.resolution_percentage = 100
-  render_args.tile_x = args.render_tile_size
-  render_args.tile_y = args.render_tile_size
+  render_args.image_settings.file_format = 'PNG'
+  render_args.image_settings.color_mode = 'RGBA'
+  set_render_tile_size(bpy.context.scene, args.render_tile_size)
   if args.use_gpu == 1:
-    # Blender changed the API for enabling CUDA at some point
-    if bpy.app.version < (2, 78, 0):
-      bpy.context.user_preferences.system.compute_device_type = 'CUDA'
-      bpy.context.user_preferences.system.compute_device = 'CUDA_0'
-    else:
-      cycles_prefs = bpy.context.user_preferences.addons['cycles'].preferences
-      cycles_prefs.compute_device_type = 'CUDA'
+    configure_cycles_devices(args.gpu_backend)
 
   # Some CYCLES-specific stuff
-  bpy.data.worlds['World'].cycles.sample_as_light = True
-  bpy.context.scene.cycles.blur_glossy = 2.0
+  world = bpy.data.worlds.get('World')
+  if world is not None and hasattr(world, 'cycles'):
+    set_if_exists(world.cycles, 'sample_as_light', True)
+  set_if_exists(bpy.context.scene.cycles, 'blur_glossy', 2.0)
   bpy.context.scene.cycles.samples = args.render_num_samples
-  bpy.context.scene.cycles.transparent_min_bounces = args.render_min_bounces
-  bpy.context.scene.cycles.transparent_max_bounces = args.render_max_bounces
+  set_if_exists(bpy.context.scene.cycles, 'transparent_min_bounces',
+                args.render_min_bounces)
+  set_if_exists(bpy.context.scene.cycles, 'transparent_max_bounces',
+                args.render_max_bounces)
   if args.use_gpu == 1:
     bpy.context.scene.cycles.device = 'GPU'
 
@@ -259,9 +381,11 @@ def render_scene(args,
       'objects': [],
       'directions': {},
   }
+  if random_seed is not None:
+    scene_struct['random_seed'] = random_seed
 
   # Put a plane on the ground so we can compute cardinal directions
-  bpy.ops.mesh.primitive_plane_add(radius=5)
+  add_plane(size=10)
   plane = bpy.context.object
 
   def rand(L):
@@ -276,9 +400,10 @@ def render_scene(args,
   # them in the scene structure
   camera = bpy.data.objects['Camera']
   plane_normal = plane.data.vertices[0].normal
-  cam_behind = camera.matrix_world.to_quaternion() * Vector((0, 0, -1))
-  cam_left = camera.matrix_world.to_quaternion() * Vector((-1, 0, 0))
-  cam_up = camera.matrix_world.to_quaternion() * Vector((0, 1, 0))
+  camera_quat = camera.matrix_world.to_quaternion()
+  cam_behind = rotate_vector(camera_quat, Vector((0, 0, -1)))
+  cam_left = rotate_vector(camera_quat, Vector((-1, 0, 0)))
+  cam_up = rotate_vector(camera_quat, Vector((0, 1, 0)))
   plane_behind = (cam_behind - cam_behind.project(plane_normal)).normalized()
   plane_left = (cam_left - cam_left.project(plane_normal)).normalized()
   plane_up = cam_up.project(plane_normal).normalized()
@@ -483,10 +608,12 @@ def check_visibility(blender_objects, min_pixels_per_object):
 
   Returns True if all objects are visible and False otherwise.
   """
-  f, path = tempfile.mkstemp(suffix='.png')
+  fd, path = tempfile.mkstemp(suffix='.png')
+  os.close(fd)
   object_colors = render_shadeless(blender_objects, path=path)
   img = bpy.data.images.load(path)
   p = list(img.pixels)
+  bpy.data.images.remove(img)
   color_count = Counter((p[i], p[i+1], p[i+2], p[i+3])
                         for i in range(0, len(p), 4))
   os.remove(path)
@@ -505,57 +632,125 @@ def render_shadeless(blender_objects, path='flat.png'):
   rendered image. The image itself is written to path. This is used to ensure
   that all objects will be visible in the final rendered scene.
   """
+  scene = bpy.context.scene
   render_args = bpy.context.scene.render
 
   # Cache the render args we are about to clobber
   old_filepath = render_args.filepath
   old_engine = render_args.engine
-  old_use_antialiasing = render_args.use_antialiasing
+  old_use_antialiasing = getattr(render_args, 'use_antialiasing', None)
+  old_display_settings = {}
+  old_shading_settings = {}
+  old_view_settings = {}
 
-  # Override some render settings to have flat shading
-  render_args.filepath = path
-  render_args.engine = 'BLENDER_RENDER'
-  render_args.use_antialiasing = False
+  if hasattr(scene, 'display'):
+    for attr in ['render_aa', 'viewport_aa']:
+      if hasattr(scene.display, attr):
+        old_display_settings[attr] = getattr(scene.display, attr)
+    if hasattr(scene.display, 'shading'):
+      for attr in ['light', 'color_type', 'show_shadows', 'show_cavity']:
+        if hasattr(scene.display.shading, attr):
+          old_shading_settings[attr] = getattr(scene.display.shading, attr)
 
-  # Move the lights and ground to layer 2 so they don't render
-  utils.set_layer(bpy.data.objects['Lamp_Key'], 2)
-  utils.set_layer(bpy.data.objects['Lamp_Fill'], 2)
-  utils.set_layer(bpy.data.objects['Lamp_Back'], 2)
-  utils.set_layer(bpy.data.objects['Ground'], 2)
+  if hasattr(scene, 'view_settings'):
+    for attr in ['view_transform', 'look', 'exposure', 'gamma']:
+      if hasattr(scene.view_settings, attr):
+        old_view_settings[attr] = getattr(scene.view_settings, attr)
 
-  # Add random shadeless materials to all objects
+  hidden_objects = []
+  for name in ['Lamp_Key', 'Lamp_Fill', 'Lamp_Back', 'Ground']:
+    obj = get_object(name)
+    if obj is not None:
+      hidden_objects.append((obj, obj.hide_render))
+
   object_colors = set()
   old_materials = []
-  for i, obj in enumerate(blender_objects):
-    old_materials.append(obj.data.materials[0])
-    bpy.ops.material.new()
-    mat = bpy.data.materials['Material']
-    mat.name = 'Material_%d' % i
-    while True:
-      r, g, b = [random.random() for _ in range(3)]
-      if (r, g, b) not in object_colors: break
-    object_colors.add((r, g, b))
-    mat.diffuse_color = [r, g, b]
-    mat.use_shadeless = True
-    obj.data.materials[0] = mat
+  old_object_colors = []
+  shadeless_materials = []
+  use_workbench = bpy.app.version >= (2, 80, 0)
 
-  # Render the scene
-  bpy.ops.render.render(write_still=True)
+  try:
+    # Override some render settings to have flat shading. Blender Internal was
+    # removed in 2.80, so use Workbench's flat object-color pass in newer builds.
+    render_args.filepath = path
+    if use_workbench:
+      render_args.engine = 'BLENDER_WORKBENCH'
+      set_if_exists(scene.display, 'render_aa', 'OFF')
+      set_if_exists(scene.display, 'viewport_aa', 'OFF')
+      if hasattr(scene.display, 'shading'):
+        set_if_exists(scene.display.shading, 'light', 'FLAT')
+        set_if_exists(scene.display.shading, 'color_type', 'OBJECT')
+        set_if_exists(scene.display.shading, 'show_shadows', False)
+        set_if_exists(scene.display.shading, 'show_cavity', False)
+      if hasattr(scene, 'view_settings'):
+        set_if_exists(scene.view_settings, 'view_transform', 'Standard')
+        set_if_exists(scene.view_settings, 'look', 'None')
+        set_if_exists(scene.view_settings, 'exposure', 0)
+        set_if_exists(scene.view_settings, 'gamma', 1)
+    else:
+      render_args.engine = 'BLENDER_RENDER'
+      render_args.use_antialiasing = False
 
-  # Undo the above; first restore the materials to objects
-  for mat, obj in zip(old_materials, blender_objects):
-    obj.data.materials[0] = mat
+    for obj, _ in hidden_objects:
+      obj.hide_render = True
 
-  # Move the lights and ground back to layer 0
-  utils.set_layer(bpy.data.objects['Lamp_Key'], 0)
-  utils.set_layer(bpy.data.objects['Lamp_Fill'], 0)
-  utils.set_layer(bpy.data.objects['Lamp_Back'], 0)
-  utils.set_layer(bpy.data.objects['Ground'], 0)
+    # Assign random flat colors to all objects.
+    for i, obj in enumerate(blender_objects):
+      old_materials.append(obj.data.materials[0] if len(obj.data.materials) else None)
+      old_object_colors.append(tuple(obj.color) if hasattr(obj, 'color') else None)
+      while True:
+        r, g, b = [random.random() for _ in range(3)]
+        if (r, g, b) not in object_colors:
+          break
+      object_colors.add((r, g, b))
 
-  # Set the render settings back to what they were
-  render_args.filepath = old_filepath
-  render_args.engine = old_engine
-  render_args.use_antialiasing = old_use_antialiasing
+      if use_workbench:
+        obj.color = (r, g, b, 1.0)
+      else:
+        mat = bpy.data.materials.new('Material_%d' % i)
+        utils.set_material_diffuse_color(mat, [r, g, b, 1.0])
+        if hasattr(mat, 'use_shadeless'):
+          mat.use_shadeless = True
+        obj.data.materials[0] = mat
+        shadeless_materials.append(mat)
+
+    # Render the scene
+    bpy.ops.render.render(write_still=True)
+
+  finally:
+    # Restore object materials and object colors.
+    for mat, obj, color in zip(old_materials, blender_objects, old_object_colors):
+      if mat is not None:
+        if len(obj.data.materials) == 0:
+          obj.data.materials.append(mat)
+        else:
+          obj.data.materials[0] = mat
+      if color is not None:
+        obj.color = color
+
+    for mat in shadeless_materials:
+      try:
+        bpy.data.materials.remove(mat)
+      except RuntimeError:
+        pass
+
+    for obj, old_hide_render in hidden_objects:
+      obj.hide_render = old_hide_render
+
+    # Set the render settings back to what they were.
+    render_args.filepath = old_filepath
+    render_args.engine = old_engine
+    if old_use_antialiasing is not None:
+      render_args.use_antialiasing = old_use_antialiasing
+    if hasattr(scene, 'display'):
+      for attr, value in old_display_settings.items():
+        setattr(scene.display, attr, value)
+      if hasattr(scene.display, 'shading'):
+        for attr, value in old_shading_settings.items():
+          setattr(scene.display.shading, attr, value)
+    if hasattr(scene, 'view_settings'):
+      for attr, value in old_view_settings.items():
+        setattr(scene.view_settings, attr, value)
 
   return object_colors
 
@@ -577,4 +772,3 @@ if __name__ == '__main__':
     print('arguments like this:')
     print()
     print('python render_images.py --help')
-

@@ -1,4 +1,4 @@
-# CLEVR Dataset Generation
+# CLEVR Dataset Generation New Version
 
 This is the code used to generate the [CLEVR dataset](http://cs.stanford.edu/people/jcjohns/clevr/) as described in the paper:
 
@@ -14,6 +14,14 @@ This is the code used to generate the [CLEVR dataset](http://cs.stanford.edu/peo
  Presented at [CVPR 2017](http://cvpr2017.thecvf.com/)
 
 Code and pretrained models for the baselines used in the paper [can be found here](https://github.com/facebookresearch/clevr-iep).
+
+This repository is based on the original CLEVR dataset generation project and has been updated so that image generation can run with Blender 3.6 and CUDA 12.
+
+Main upgrades in this version:
+
+- Image generation supports setting a random seed and controlling the number of generated images.
+- Question generation supports setting a random seed and generating only one or more selected question types.
+- Question generation provides an interface for writing Chain-of-Thought (CoT) content for each question type.
 
 You can use this code to render synthetic images and compositional questions for those images, like this:
 
@@ -48,22 +56,49 @@ If you find this code useful in your research then please cite
 }
 ```
 
-All code was developed and tested on OSX and Ubuntu 16.04.
+The original code was developed and tested on OSX and Ubuntu 16.04. This version has been adapted for Blender 3.6, whose bundled Python is 3.10, and can use CUDA 12 compatible NVIDIA drivers for GPU rendering.
 
 ## Step 1: Generating Images
 First we render synthetic images using [Blender](https://www.blender.org/), outputting both rendered images as well as a JSON file containing ground-truth scene information for each image.
 
-Blender ships with its own installation of Python which is used to execute scripts that interact with Blender; you'll need to add the `image_generation` directory to Python path of Blender's bundled Python. The easiest way to do this is by adding a `.pth` file to the `site-packages` directory of Blender's Python, like this:
+### Installing Blender 3.6
+
+Install Blender 3.6 LTS, then add its directory to your shell `PATH` so later commands can call `blender` directly. On Linux, download and extract the official Blender 3.6.23 tarball:
 
 ```bash
-echo $PWD/image_generation >> $BLENDER/$VERSION/python/lib/python3.5/site-packages/clevr.pth
+wget https://download.blender.org/release/Blender3.6/blender-3.6.23-linux-x64.tar.xz
+tar -xf blender-3.6.23-linux-x64.tar.xz
 ```
 
-where `$BLENDER` is the directory where Blender is installed and `$VERSION` is your Blender version; for example on OSX you might run:
+Add the extracted Blender directory to your shell startup file:
 
 ```bash
-echo $PWD/image_generation >> /Applications/blender/blender.app/Contents/Resources/2.78/python/lib/python3.5/site-packages/clevr.pth
+echo "export PATH=$(pwd)/blender-3.6.23-linux-x64:\$PATH" >> ~/.bashrc
+source ~/.bashrc
 ```
+
+If you installed Blender somewhere else, replace `$(pwd)/blender-3.6.23-linux-x64` with that path when updating `PATH`.
+
+Check that Blender is available:
+
+```bash
+blender --version
+```
+
+Blender ships with its own installation of Python which is used to execute scripts that interact with Blender. Blender 3.6 uses Python 3.10. In most cases `render_images.py` can now import `utils.py` directly when run from `image_generation`; if Blender cannot import it, add the `image_generation` directory to Blender's bundled Python path with a `.pth` file:
+
+```bash
+echo $PWD/image_generation >> blender-3.6.23-linux-x64/3.6/python/lib/python3.10/site-packages/clevr.pth
+```
+
+If Blender was extracted somewhere else, use that Blender directory in the `.pth` path.
+For example:
+
+```bash
+echo $PWD/image_generation >> /path/to/blender-3.6.23-linux-x64/3.6/python/lib/python3.10/site-packages/clevr.pth
+```
+
+### Rendering Images
 
 You can then render some images like this:
 
@@ -72,20 +107,27 @@ cd image_generation
 blender --background --python render_images.py -- --num_images 10
 ```
 
-On OSX the `blender` binary is located inside the blender.app directory; for convenience you may want to
-add the following alias to your `~/.bash_profile` file:
+To make generation reproducible and force an exact object count per image:
+
+```bash
+blender --background --python render_images.py -- --num_images 10 --random_seed 123 --num_objects 5
+```
+
+On OSX the `blender` binary is located inside the blender.app directory; for convenience you may want to add the following alias to your `~/.bash_profile` file:
 
 ```bash
 alias blender='/Applications/blender/blender.app/Contents/MacOS/blender'
 ```
 
-If you have an NVIDIA GPU with CUDA installed then you can use the GPU to accelerate rendering like this:
+If you have an NVIDIA GPU, CUDA 12, and a driver supported by Blender 3.6, then you can use the GPU to accelerate rendering like this:
 
 ```bash
-blender --background --python render_images.py -- --num_images 10 --use_gpu 1
+blender --background --python render_images.py -- --num_images 10 --use_gpu 1 --gpu_backend CUDA
 ```
 
-After this command terminates you should have ten freshly rendered images stored in `output/images` like these:
+On RTX cards, `--gpu_backend OPTIX` is also supported by Blender 3.6 and may be faster.
+
+After a rendering command terminates you should have ten freshly rendered images stored in `output/images` like these:
 
 <div align="center">
   <img src="images/img1.png" width="260px">
