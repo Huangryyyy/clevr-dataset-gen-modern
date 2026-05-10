@@ -66,6 +66,9 @@ parser.add_argument('--question_types', default='all',
 parser.add_argument('--output_questions_file',
     default='../output/CLEVR_questions.json',
     help="The output file to write containing generated questions")
+parser.add_argument('--add_post_prompt', action='store_true',
+    help="Append an answer-format instruction to every generated question. " +
+         "The instruction is chosen from the question answer type.")
 
 # Control which and how many images to process
 parser.add_argument('--scene_start_idx', default=0, type=int,
@@ -148,21 +151,15 @@ INTEGER_COMPARE_FINAL_NODES = set([
   'equal_integer', 'less_than', 'greater_than',
 ])
 
-COT_TEMPLATES = {
-  # Fill these placeholders as CoT templates are authored. Lookup order is:
-  # exact family key such as "zero_hop:0", template type such as "zero_hop",
-  # then "default".
-  'zero_hop': '',
-  'one_hop': '',
-  'two_hop': '',
-  'three_hop': '',
-  'same_relate': '',
-  'comparison': '',
-  'compare_integer': '',
-  'single_and': '',
-  'single_or': '',
-  'default': '',
+POST_PROMPTS = {
+  'Bool': 'Answer with only yes or no in curly braces, e.g. {yes}.',
+  'Integer': 'Answer with only the number in curly braces, e.g. {1}.',
+  'Shape': 'Answer with only the shape name in curly braces, e.g. {sphere}.',
+  'Color': 'Answer with only the color name in curly braces, e.g. {red}.',
+  'Size': 'Answer with only the size name in curly braces, e.g. {small}.',
+  'Material': 'Answer with only the material name in curly braces, e.g. {rubber}.',
 }
+
 
 
 def normalize_question_type(s):
@@ -236,6 +233,23 @@ def get_template_question_types(template_filename, question_family_index,
   return question_types
 
 
+def get_template_answer_dtype(template, metadata):
+  node_type_to_dtype = {n['name']: n['output'] for n in metadata['functions']}
+  final_node_type = template['nodes'][-1]['type']
+  return node_type_to_dtype[final_node_type]
+
+
+def get_post_prompt(template, metadata):
+  answer_dtype = get_template_answer_dtype(template, metadata)
+  return POST_PROMPTS.get(
+    answer_dtype,
+    'Answer with only the answer in curly braces, e.g. {answer}.')
+
+
+def add_post_prompt(question_text, template, metadata):
+  return '%s %s' % (question_text.rstrip(), get_post_prompt(template, metadata))
+
+
 def filter_templates_by_question_types(templates, metadata, question_types):
   if question_types is None:
     return templates
@@ -266,13 +280,6 @@ def filter_templates_by_question_types(templates, metadata, question_types):
   return filtered_templates
 
 
-def get_cot_template(template_filename, question_family_index):
-  base = normalize_question_type(os.path.splitext(template_filename)[0])
-  family_key = question_type_key(template_filename, question_family_index)
-  for key in [family_key, base, 'default']:
-    if key in COT_TEMPLATES:
-      return COT_TEMPLATES[key]
-  return ''
 
 
 def get_node_value_inputs(node):
@@ -335,28 +342,18 @@ def format_object_list_for_cot(scene_struct, object_idxs):
   return '%s, and %s' % (', '.join(parts[:-1]), parts[-1])
 
 
-def fill_cot_template(context, generator_name):
-  """
-  CoT hook for future implementation.
-
-  Keep the output as a plain string. Future generators can read
-  context['template_values'], context['program'], context['answer'], etc. and
-  return a filled natural-language rationale.
-  """
-  return get_cot_template(context['template_filename'],
-                          context['question_family_index'])
 
 
 def generate_zero_hop_cot(context):
-  return fill_cot_template(context, 'generate_zero_hop_cot')
+  pass
 
 
 def generate_one_hop_cot(context):
-  return fill_cot_template(context, 'generate_one_hop_cot')
+  pass
 
 
 def generate_two_hop_cot(context):
-  return fill_cot_template(context, 'generate_two_hop_cot')
+  pass
 
 
 def generate_three_hop_cot(context):
@@ -370,8 +367,6 @@ def generate_three_hop_cot(context):
                   if node['type'] == 'unique']
   relate_nodes = [i for i, node in enumerate(program)
                   if node['type'] == 'relate']
-  if len(unique_nodes) < 3 or len(relate_nodes) < 3:
-    return fill_cot_template(context, 'generate_three_hop_cot')
 
   chain_objects = [outputs[i] for i in unique_nodes[:3]]
   relations = [get_node_value_inputs(program[i])[0] for i in relate_nodes[:3]]
@@ -407,35 +402,33 @@ def generate_three_hop_cot(context):
       steps.append('Step 4: The matching objects %s are %s.' % (
           relation_phrase,
           format_object_list_for_cot(scene_struct, final_object_idxs)))
-  else:
-    return fill_cot_template(context, 'generate_three_hop_cot')
 
-  steps.append('Answer: %s.' % format_answer_for_cot(context['answer']))
+  steps.append('Answer: {%s}.' % format_answer_for_cot(context['answer']))
   return '\n'.join(steps)
 
 
 def generate_same_relate_cot(context):
-  return fill_cot_template(context, 'generate_same_relate_cot')
+  pass
 
 
 def generate_comparison_cot(context):
-  return fill_cot_template(context, 'generate_comparison_cot')
+  pass
 
 
 def generate_compare_integer_cot(context):
-  return fill_cot_template(context, 'generate_compare_integer_cot')
+  pass
 
 
 def generate_single_and_cot(context):
-  return fill_cot_template(context, 'generate_single_and_cot')
+  pass
 
 
 def generate_single_or_cot(context):
-  return fill_cot_template(context, 'generate_single_or_cot')
+  pass
 
 
 def generate_default_cot(context):
-  return fill_cot_template(context, 'generate_default_cot')
+  pass
 
 
 COT_GENERATORS = {
@@ -1027,12 +1020,15 @@ def main(args):
         print('that took ', toc - tic)
       image_index = int(os.path.splitext(scene_fn)[0].split('_')[-1])
       for t, q, a, v in zip(ts, qs, ans, vals):
+        question_text = t
+        if args.add_post_prompt:
+          question_text = add_post_prompt(question_text, template, metadata)
         questions.append({
           'split': scene_info['split'],
           'image_filename': scene_fn,
           'image_index': image_index,
           'image': os.path.splitext(scene_fn)[0],
-          'question': t,
+          'question': question_text,
           'program': q,
           'answer': a,
           'template_filename': fn,
@@ -1043,7 +1039,7 @@ def main(args):
             'question_family_index': idx,
             'template': template,
             'template_values': v,
-            'question': t,
+            'question': question_text,
             'program': q,
             'answer': a,
             'scene_struct': scene_struct,
@@ -1085,7 +1081,7 @@ def main(args):
     json.dump({
         'info': scene_info,
         'questions': questions,
-      }, f)
+      }, f,indent=2)
 
 
 if __name__ == '__main__':

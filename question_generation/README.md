@@ -99,13 +99,32 @@ python generate_questions.py \
 If the selected question types contain fewer templates than `--templates_per_image`, the script can only instantiate from
 the selected templates.
 
+## Adding answer-format prompts
+Use `--add_post_prompt` to append an answer-format instruction to the end of every generated question. The appended sentence
+depends on the answer type of the template:
+
+- Boolean answers: `Answer with only yes or no in curly braces, e.g. {yes}.`
+- Integer answers: `Answer with only the number in curly braces, e.g. {1}.`
+- Shape answers: `Answer with only the shape name in curly braces, e.g. {sphere}.`
+- Color answers: `Answer with only the color name in curly braces, e.g. {red}.`
+- Size answers: `Answer with only the size name in curly braces, e.g. {small}.`
+- Material answers: `Answer with only the material name in curly braces, e.g. {rubber}.`
+
+Example:
+
+```bash
+python generate_questions.py \
+  --input_scene_file $INPUT_FILE \
+  --output_questions_file $OUTPUT_FILE \
+  --question_types count,query \
+  --add_post_prompt
+```
+
+This changes only the natural-language `question` string. It does not change the functional `program`, `answer`, or `cot`
+fields.
+
 ## Chain-of-thought output
 Each generated question now includes an additional `cot` field in the output JSON. The field is always a string.
-
-For most question types, `cot` is currently an empty string placeholder. The script includes a `COT_TEMPLATES` dictionary
-and one `generate_*_cot(context)` function per template family so that future CoT templates can be filled in one place.
-Generator functions receive a context object containing the template filename, family index, instantiated template values,
-natural-language question, functional program, answer, scene structure, and metadata.
 
 The `three_hop` family has a concrete English CoT implementation. It follows the spatial chain through the instantiated
 program, reads object pixel coordinates from `pixel_coords`, and emits a string like:
