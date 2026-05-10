@@ -20,7 +20,7 @@ This repository is based on the original CLEVR dataset generation project and ha
 Main upgrades in this version:
 
 - Image generation supports setting a random seed and controlling the number of generated images.
-- Question generation supports setting a random seed and generating only one or more selected question types.
+- Question generation supports setting a random seed, generating only one or more selected question types and adding post prompts.
 - Question generation provides an interface for writing Chain-of-Thought (CoT) content for each question type.
 
 You can use this code to render synthetic images and compositional questions for those images, like this:
